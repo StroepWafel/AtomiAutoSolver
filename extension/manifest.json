@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Atomi Quiz Auto Solver",
+  "version": "1.0.0",
+  "description": "Automatically solves Atomi quiz questions using the Groq API",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": [
+    "https://api.groq.com/*",
+    "*://*.atomi.com/*",
+    "*://*.learnatomi.com/*",
+    "*://atomi.com/*",
+    "*://learnatomi.com/*",
+    "file:///*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "atomi-autosolver@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "web_accessible_resources": [{
+    "resources": ["popup.html"],
+    "matches": ["<all_urls>"]
+  }],
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }]
+}
