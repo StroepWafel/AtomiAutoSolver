@@ -11,6 +11,14 @@ const SYSTEM_PROMPT = `You solve quiz questions. You are given a question and po
 Respond with ONLY the number of the correct answer. Nothing else. No explanation. Just the digit.
 Example: if the 3rd answer is correct, respond with: 3`;
 
+const WORKING_OUT_PROMPT = `You solve maths/physics working-out questions. Output ONLY the raw working to put in the answer field.
+- Use LaTeX notation (e.g. \\frac{a}{b}, x^2, \\sqrt{x}, =, \\therefore)
+- Put each step on a new line: use \\\\ between steps, or use \\begin{align*}...\\\\...\\\\ \\end{align*}
+- Example format: y(t)=y_0+vt-\\frac{1}{2}gt^2 \\\\ y=y_0 \\Rightarrow t(v-\\frac{1}{2}gt)=0 \\\\ t=\\frac{2v}{g}
+- Include any required assumptions in one short line if needed (e.g. "Assume g=10")
+- No explanations, no "Step 1:", no preamble - just the maths and working
+- Output a single block that can be pasted directly into a math input field`;
+
 // Quiz detection selectors (flexible for Atomi's structure)
 const QUIZ_SELECTORS = {
   article: 'article',
@@ -24,6 +32,77 @@ const QUIZ_SELECTORS = {
   }),
   backButton: (doc) => Array.from(doc.querySelectorAll('button')).find(b => b.textContent?.includes('Back')),
 };
+
+function findInDocument(root, selector) {
+  const el = root.querySelector?.(selector);
+  if (el) return el;
+  for (const node of root.querySelectorAll?.('*') || []) {
+    if (node.shadowRoot) {
+      const found = findInDocument(node.shadowRoot, selector);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function isWorkingOutPage() {
+  const mathField = findInDocument(document, 'math-field') || document.querySelector('math-field');
+  if (!mathField) return false;
+  const selfMarkBtn = Array.from(document.querySelectorAll('button')).find(b =>
+    (b.textContent || '').includes('Self-mark'));
+  return !!selfMarkBtn;
+}
+
+function hasInertAncestor(el) {
+  let p = el?.parentElement;
+  while (p) {
+    if (p.hasAttribute?.('inert')) return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+
+function getMathField() {
+  const label = Array.from(document.querySelectorAll('label')).find(l =>
+    (l.textContent || '').trim() === 'Your answer');
+  if (label?.htmlFor) {
+    const mf = document.getElementById(label.htmlFor);
+    if (mf?.tagName === 'MATH-FIELD' && !hasInertAncestor(mf)) return mf;
+  }
+  if (label?.control?.tagName === 'MATH-FIELD') return label.control;
+  const byAria = document.querySelector('math-field[aria-label*="Your answer"]');
+  if (byAria && !hasInertAncestor(byAria)) return byAria;
+  const all = document.querySelectorAll('math-field');
+  for (const mf of all) {
+    if (hasInertAncestor(mf)) continue;
+    const rect = mf.getBoundingClientRect();
+    const style = getComputedStyle(mf);
+    if (rect.width > 50 && rect.height > 20 && style.visibility !== 'hidden' && style.display !== 'none') {
+      return mf;
+    }
+  }
+  return document.querySelector('math-field');
+}
+
+function getWorkingOutQuestionText() {
+  const roots = document.querySelectorAll('[class*="Markdown_root"]');
+  const parts = [];
+  for (const root of roots) {
+    const paras = root.querySelectorAll('[class*="Markdown_paragraph"], p');
+    for (const p of paras) {
+      const t = p.textContent?.trim();
+      if (t && !parts.includes(t)) parts.push(t);
+    }
+    const imgs = root.querySelectorAll('img[alt]');
+    for (const img of imgs) {
+      const alt = img.getAttribute('alt')?.trim();
+      if (alt) parts.push(`[Image: ${alt}]`);
+    }
+  }
+  const marksEl = document.querySelector('[class*="marks"]') || Array.from(document.querySelectorAll('p')).find(p => /^\d+\s*marks?$/i.test(p?.textContent?.trim() || ''));
+  if (marksEl) parts.push((marksEl.textContent || '').trim());
+  return parts.filter(Boolean).join('\n').trim();
+}
 
 let panel = null;
 let isAutoRunning = false;
@@ -303,6 +382,145 @@ async function callGroqAPI(apiKey, model, question, answers) {
   return valid.length > 0 ? valid[valid.length - 1] : null;
 }
 
+async function callGroqAPIForWorkingOut(apiKey, model, question) {
+  const response = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: model || DEFAULT_MODEL,
+      messages: [
+        { role: 'system', content: WORKING_OUT_PROMPT },
+        { role: 'user', content: `Question:\n${question}\n\nOutput only the raw working out (LaTeX, no explanation):` },
+      ],
+      max_tokens: 2048,
+      temperature: 0.2,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error?.message || `API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const msg = data.choices?.[0]?.message || {};
+  return (msg.content || '').trim();
+}
+
+function dispatchPasteWithData(mathField, latex) {
+  let dt;
+  try {
+    dt = new DataTransfer();
+    dt.setData('text/plain', latex);
+  } catch (_) {
+    return false;
+  }
+  const evt = new ClipboardEvent('paste', {
+    bubbles: true,
+    cancelable: true,
+    clipboardData: dt,
+  });
+  mathField.focus?.();
+  mathField.dispatchEvent(evt);
+  return true;
+}
+
+function forceSetValue(el, value) {
+  try {
+    const proto = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value') ||
+      Object.getOwnPropertyDescriptor(el, 'value');
+    if (desc?.set) {
+      desc.set.call(el, value);
+      return true;
+    }
+  } catch (_) {}
+  el.value = value;
+  return false;
+}
+
+function setMathFieldValueInPage(mathFieldId, latex) {
+  if (!mathFieldId || !document.body) return;
+  const safeId = String(mathFieldId).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/</g, '\\u003c');
+  document.body.setAttribute('data-atomi-latex-temp', latex);
+  const script = document.createElement('script');
+  script.textContent = '(function(){var el=document.getElementById("' + safeId + '");var s=document.body.getAttribute("data-atomi-latex-temp");document.body.removeAttribute("data-atomi-latex-temp");if(!el||!s)return;try{if(typeof el.setValue==="function")el.setValue(s,{insertionMode:"replaceAll",format:"latex"});else el.value=s;el.dispatchEvent(new InputEvent("input",{bubbles:true}));el.dispatchEvent(new Event("change",{bubbles:true}));}catch(e){}})();';
+  (document.head || document.documentElement).appendChild(script);
+  script.remove();
+}
+
+async function setMathFieldValue(mathField, latex) {
+  const id = mathField.id;
+  mathField.focus?.();
+  mathField.scrollIntoView?.({ block: 'center' });
+
+  if (id) setMathFieldValueInPage(id, latex);
+  dispatchPasteWithData(mathField, latex);
+  await new Promise(r => setTimeout(r, 80));
+
+  const opts = { insertionMode: 'replaceAll', format: 'latex' };
+  if (typeof mathField.setValue === 'function') {
+    mathField.setValue(latex, opts);
+  } else if (typeof mathField.insert === 'function') {
+    mathField.insert(latex, opts);
+  } else if (typeof mathField.executeCommand === 'function') {
+    mathField.executeCommand('selectAll');
+    mathField.executeCommand('insert', latex, { insertionMode: 'replaceSelection' });
+  } else {
+    forceSetValue(mathField, latex);
+  }
+
+  try {
+    mathField.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+    mathField.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (_) {}
+
+  await new Promise(r => setTimeout(r, 120));
+  if (typeof mathField.setValue === 'function') {
+    mathField.setValue(latex, opts);
+  } else {
+    forceSetValue(mathField, latex);
+  }
+  mathField.dispatchEvent(new InputEvent('input', { bubbles: true }));
+}
+
+async function runWorkingOutAutofill(apiKey, statusCallback) {
+  const mathField = getMathField();
+  let question = getWorkingOutQuestionText();
+
+  if (!mathField) {
+    statusCallback?.('No math input found');
+    return { success: false, error: 'No math field found' };
+  }
+  if (!question) {
+    question = document.body?.innerText?.slice(0, 3000) || '';
+    if (!question) {
+      statusCallback?.('No question text found');
+      return { success: false, error: 'Could not extract question' };
+    }
+    statusCallback?.('Using page text...');
+  }
+
+  statusCallback?.('Solving working out...');
+  try {
+    const { model } = await ext.storage.local.get('model');
+    const workingOut = await callGroqAPIForWorkingOut(apiKey, model || DEFAULT_MODEL, question);
+    if (!workingOut) {
+      statusCallback?.('Empty response from API');
+      return { success: false, error: 'Empty API response' };
+    }
+    await setMathFieldValue(mathField, workingOut);
+    statusCallback?.('Working out filled');
+    return { success: true };
+  } catch (err) {
+    statusCallback?.(`Error: ${err.message}`);
+    return { success: false, error: err.message };
+  }
+}
+
 async function solveCurrentQuestion(apiKey) {
   const question = getQuestionText();
   const answers = getAnswers();
@@ -437,6 +655,9 @@ function createPanel() {
       <div class="atomi-video-section" id="atomi-video-section" style="display:none;">
         <button type="button" id="atomi-video-toggle" class="atomi-btn atomi-btn-secondary">Video: Auto-advance OFF</button>
       </div>
+      <div class="atomi-working-out-section" id="atomi-working-out-section" style="display:none;">
+        <button type="button" id="atomi-working-out" class="atomi-btn atomi-btn-primary">Autofill Working Out</button>
+      </div>
     </div>
   `;
 
@@ -491,7 +712,7 @@ function createPanel() {
       text-decoration: underline;
     }
     .atomi-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
-    .atomi-video-section { margin-top: 10px; }
+    .atomi-video-section, .atomi-working-out-section { margin-top: 10px; }
     .atomi-btn {
       flex: 1;
       min-width: 80px;
@@ -520,8 +741,13 @@ function showPanel() {
   createPanel();
   const quizSection = panel.querySelector('.atomi-buttons');
   const videoSection = document.getElementById('atomi-video-section');
-  if (quizSection) quizSection.style.display = isQuizPage() ? '' : 'none';
-  if (videoSection) videoSection.style.display = isVideoPage() ? '' : 'none';
+  const workingOutSection = document.getElementById('atomi-working-out-section');
+  const onQuiz = isQuizPage();
+  const onVideo = isVideoPage();
+  const onWorkingOut = isWorkingOutPage();
+  if (quizSection) quizSection.style.display = onQuiz ? '' : 'none';
+  if (videoSection) videoSection.style.display = onVideo ? '' : 'none';
+  if (workingOutSection) workingOutSection.style.display = onWorkingOut ? '' : 'none';
   panel.style.display = '';
 }
 
@@ -543,7 +769,7 @@ function setupPanelListeners() {
   };
 
   const checkApiKey = async () => {
-    const videoOnly = isVideoPage() && !isQuizPage();
+    const videoOnly = isVideoPage() && !isQuizPage() && !isWorkingOutPage();
     const { apiKey } = await ext.storage.local.get('apiKey');
     const hasKey = apiKey && apiKey.trim().length > 0;
     if (apiWarning) apiWarning.style.display = (videoOnly || hasKey) ? 'none' : 'block';
@@ -574,6 +800,17 @@ function setupPanelListeners() {
     stopBtn.onclick = () => {
       isAutoRunning = false;
       setStatus('Stopping...');
+    };
+  }
+
+  const workingOutBtn = document.getElementById('atomi-working-out');
+  if (workingOutBtn) {
+    workingOutBtn.onclick = async () => {
+      const apiKey = await checkApiKey();
+      if (!apiKey) return;
+      workingOutBtn.disabled = true;
+      await runWorkingOutAutofill(apiKey, setStatus);
+      workingOutBtn.disabled = false;
     };
   }
 
@@ -669,7 +906,7 @@ function checkVideoAutoAdvanceDisable() {
 function runInit() {
   if (!document.body) return;
   checkVideoAutoAdvanceDisable();
-  if (isQuizPage() || isVideoPage()) {
+  if (isQuizPage() || isVideoPage() || isWorkingOutPage()) {
     showPanel();
     setupPanelListeners();
   }
@@ -685,7 +922,7 @@ if (document.readyState === 'loading') {
 if (document.body) {
   const observer = new MutationObserver(() => {
     checkVideoAutoAdvanceDisable();
-    if ((isQuizPage() || isVideoPage()) && !panel) runInit();
+    if ((isQuizPage() || isVideoPage() || isWorkingOutPage()) && !panel) runInit();
   });
   observer.observe(document.body, { childList: true, subtree: true });
 }
